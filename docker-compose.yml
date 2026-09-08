@@ -21,6 +21,5 @@ services:
     volumes:
       - "${NOVEL_PATH:-./library/Novel}:/library/Novel:${LIBRARY_ACCESS:-ro}"
       - "${MANGA_PATH:-./library/Manga}:/library/Manga:${LIBRARY_ACCESS:-ro}"
-      - "${DOU_PATH:-./library/Dou}:/library/Dou:${LIBRARY_ACCESS:-ro}"
       - ./data:/data
       - ./cache:/cache

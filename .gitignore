@@ -1,0 +1,49 @@
+# Local configuration / secrets
+.env
+.env.*
+!.env.example
+
+# Runtime data
+/data/*
+!/data/.gitkeep
+/cache/*
+!/cache/.gitkeep
+
+# Local sample library content
+/library/**/*
+!/library/Novel/
+!/library/Novel/.gitkeep
+!/library/Manga/
+!/library/Manga/.gitkeep
+!/library/Dou/
+!/library/Dou/.gitkeep
+
+# Databases and journals
+*.sqlite
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+*.db
+*.db-wal
+*.db-shm
+
+# Python / tooling
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Keys, certificates, common secret files
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+*.cer

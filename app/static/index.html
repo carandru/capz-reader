@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="th">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+  <meta name="theme-color" content="#111827" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <link rel="manifest" href="/manifest.webmanifest" />
+  <link rel="stylesheet" href="/static/style.css" />
+  <title>NAS PDF Reader</title>
+</head>
+<body>
+<div id="auth" class="auth hidden">
+  <div class="auth-card">
+    <h1>NAS PDF Reader</h1><p id="authHint"></p>
+    <input id="username" autocomplete="username" placeholder="Username" />
+    <input id="password" type="password" autocomplete="current-password" placeholder="Password (10+ chars)" />
+    <button id="authBtn" class="primary">Continue</button><div id="authError" class="error"></div>
+  </div>
+</div>
+
+<div id="app" class="hidden">
+<header class="topbar">
+  <div class="brand"><strong>NAS PDF Reader</strong><span id="countBadge" class="badge"></span></div>
+  <div class="header-actions">
+    <button id="scanBtn" title="Scan NAS folders">↻ Scan</button>
+    <button id="selectBtn">Select</button>
+    <button id="logoutBtn">Logout</button>
+  </div>
+</header>
+
+<nav class="categories" id="categoryTabs">
+  <button data-category="" class="active">All <span data-count="All"></span></button>
+  <button data-category="Novel">Novel <span data-count="Novel"></span></button>
+  <button data-category="Manga">Manga <span data-count="Manga"></span></button>
+  <button data-category="Dou">Dou <span data-count="Dou"></span></button>
+</nav>
+
+<section class="filters">
+  <input id="search" type="search" placeholder="Search title / path / series…" />
+  <select id="seriesFilter"><option value="">All series</option></select>
+  <select id="sort">
+    <option value="title">Title</option>
+    <option value="series">Series / Volume</option>
+    <option value="added">Recently added</option>
+    <option value="modified">Recently modified</option>
+    <option value="progress">Progress</option>
+  </select>
+  <div class="view-toggle" id="viewToggle" aria-label="Library view">
+    <button data-view="books" class="active">Books</button>
+    <button data-view="series">Series</button>
+  </div>
+  <label class="switch"><input id="favorites" type="checkbox"> ★ Favorites</label>
+  <label class="switch"><input id="showArchived" type="checkbox"> Archived</label>
+</section>
+
+<div id="scanStatus" class="scan-status hidden"></div>
+<section id="continueSection" class="continue-section hidden">
+  <div class="section-head"><h2>Continue Reading</h2></div>
+  <div id="continueRow" class="continue-row"></div>
+</section>
+<div id="seriesBack" class="series-back hidden"><button id="seriesBackBtn">‹ All series</button><strong id="seriesTitle"></strong></div>
+<main id="grid" class="grid"></main>
+<div id="empty" class="empty hidden">No books found.</div>
+</div>
+
+<div id="bulkBar" class="bulk-bar hidden">
+  <button id="bulkClose" aria-label="Exit selection">✕</button>
+  <strong id="selectedCount">0 selected</strong>
+  <button id="selectVisible">Select all results</button>
+  <button data-bulk="category">Category</button>
+  <button data-bulk="series">Series</button>
+  <button data-bulk="tag">Tags</button>
+  <button data-bulk="read">Read state</button>
+  <button data-bulk="favorite">Favorite</button>
+  <button data-bulk="archive">Archive</button>
+  <button data-bulk="preview">Preview</button>
+  <button data-bulk="remove" class="danger-soft">Remove</button>
+  <button data-bulk="delete" id="physicalDelete" class="danger hidden">Delete files</button>
+</div>
+
+<div id="modal" class="modal hidden"><div class="modal-sheet"><button class="modal-x" id="modalX">✕</button><div id="modalBody"></div></div></div>
+<div id="toast" class="toast hidden"></div>
+<script src="/static/app.js"></script>
+</body>
+</html>

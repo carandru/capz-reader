@@ -1,0 +1,26 @@
+services:
+  reader:
+    build: .
+    container_name: nas-pdf-reader
+    restart: unless-stopped
+    ports:
+      - "${PORT:-8020}:8000"
+    environment:
+      APP_NAME: "${APP_NAME:-NAS PDF Reader}"
+      LIBRARY_ROOT: /library
+      DATA_DIR: /data
+      CACHE_DIR: /cache
+      AUTO_SCAN_ON_START: "${AUTO_SCAN_ON_START:-true}"
+      ALLOW_DELETE_FILES: "${ALLOW_DELETE_FILES:-false}"
+      COOKIE_SECURE: "${COOKIE_SECURE:-false}"
+      THUMB_WIDTH: "${THUMB_WIDTH:-320}"
+      PREVIEW_WIDTH: "${PREVIEW_WIDTH:-760}"
+      READER_WIDTH: "${READER_WIDTH:-1800}"
+      PUID: "${PUID:-1000}"
+      PGID: "${PGID:-1000}"
+    volumes:
+      - "${NOVEL_PATH:-./library/Novel}:/library/Novel:${LIBRARY_ACCESS:-ro}"
+      - "${MANGA_PATH:-./library/Manga}:/library/Manga:${LIBRARY_ACCESS:-ro}"
+      - "${DOU_PATH:-./library/Dou}:/library/Dou:${LIBRARY_ACCESS:-ro}"
+      - ./data:/data
+      - ./cache:/cache

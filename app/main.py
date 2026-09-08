@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import hashlib
-import json
-import mimetypes
 import os
 import queue
 import re
@@ -12,20 +10,20 @@ import sqlite3
 import threading
 import time
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 import fitz  # PyMuPDF
 from argon2 import PasswordHasher
 from argon2.exceptions import VerifyMismatchError
-from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Request, Response
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
+from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 APP_NAME = os.getenv("APP_NAME", "NAS PDF Reader")
-APP_VERSION = "0.1.0"
+APP_VERSION = "0.2.0"
 LIBRARY_ROOT = Path(os.getenv("LIBRARY_ROOT", "/library")).resolve()
 DATA_DIR = Path(os.getenv("DATA_DIR", "/data")).resolve()
 CACHE_DIR = Path(os.getenv("CACHE_DIR", "/cache")).resolve()
@@ -36,6 +34,7 @@ THUMB_WIDTH = int(os.getenv("THUMB_WIDTH", "320"))
 PREVIEW_WIDTH = int(os.getenv("PREVIEW_WIDTH", "760"))
 READER_WIDTH = int(os.getenv("READER_WIDTH", "1800"))
 SESSION_DAYS = int(os.getenv("SESSION_DAYS", "90"))
+MISSING_RETENTION_DAYS = max(1, int(os.getenv("MISSING_RETENTION_DAYS", "14")))
 COOKIE_SECURE = os.getenv("COOKIE_SECURE", "false").lower() in {"1", "true", "yes"}
 
 DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -48,7 +47,18 @@ ph = PasswordHasher()
 write_lock = threading.RLock()
 render_lock = threading.Semaphore(1)
 scan_lock = threading.Lock()
-scan_state: dict[str, Any] = {"running": False, "seen": 0, "added": 0, "updated": 0, "removed": 0, "error": None, "finished_at": None}
+scan_state: dict[str, Any] = {
+    "running": False,
+    "seen": 0,
+    "added": 0,
+    "updated": 0,
+    "missing": 0,
+    "restored": 0,
+    "purged": 0,
+    "sources_skipped": [],
+    "error": None,
+    "finished_at": None,
+}
 thumb_queue: queue.Queue[int] = queue.Queue(maxsize=5000)
 queued_thumbs: set[int] = set()
 queued_lock = threading.Lock()
@@ -56,6 +66,15 @@ queued_lock = threading.Lock()
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def parse_iso(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
 
 
 @contextmanager
@@ -79,8 +98,112 @@ def db(readonly: bool = False):
         con.close()
 
 
+def table_exists(con: sqlite3.Connection, name: str) -> bool:
+    return con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)).fetchone() is not None
+
+
+def books_table_sql(name: str = "books") -> str:
+    return f"""
+        CREATE TABLE {name} (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          rel_path TEXT NOT NULL UNIQUE,
+          title TEXT NOT NULL,
+          custom_title INTEGER NOT NULL DEFAULT 0,
+          category TEXT NOT NULL DEFAULT 'Uncategorized',
+          series TEXT,
+          volume TEXT,
+          cover_page INTEGER NOT NULL DEFAULT 1,
+          page_count INTEGER NOT NULL DEFAULT 0,
+          size INTEGER NOT NULL DEFAULT 0,
+          mtime REAL NOT NULL DEFAULT 0,
+          favorite INTEGER NOT NULL DEFAULT 0,
+          archived INTEGER NOT NULL DEFAULT 0,
+          read_state TEXT NOT NULL DEFAULT 'unread' CHECK(read_state IN ('unread','reading','read')),
+          last_page INTEGER NOT NULL DEFAULT 1,
+          minutes_spent REAL NOT NULL DEFAULT 0,
+          last_opened TEXT,
+          missing_since TEXT,
+          added_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        )
+    """
+
+
+def create_book_indexes(con: sqlite3.Connection):
+    con.execute("CREATE INDEX IF NOT EXISTS idx_books_category ON books(category)")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_books_series ON books(series)")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_books_title ON books(title)")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_books_missing ON books(missing_since)")
+
+
+def migrate_books_if_needed(con: sqlite3.Connection):
+    if not table_exists(con, "books"):
+        con.execute(books_table_sql())
+        create_book_indexes(con)
+        return
+
+    cols = {r[1] for r in con.execute("PRAGMA table_info(books)").fetchall()}
+    sql_row = con.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='books'").fetchone()
+    sql = (sql_row[0] if sql_row else "") or ""
+    needs_rebuild = "missing_since" not in cols or "CHECK(category IN" in sql
+    if not needs_rebuild:
+        create_book_indexes(con)
+        return
+
+    tag_pairs: list[tuple[int, int]] = []
+    if table_exists(con, "book_tags"):
+        tag_pairs = [(r[0], r[1]) for r in con.execute("SELECT book_id,tag_id FROM book_tags").fetchall()]
+        con.execute("DROP TABLE book_tags")
+
+    con.execute(books_table_sql("books_v02"))
+    old_cols = {r[1] for r in con.execute("PRAGMA table_info(books)").fetchall()}
+    target_cols = [
+        "id", "rel_path", "title", "custom_title", "category", "series", "volume", "cover_page",
+        "page_count", "size", "mtime", "favorite", "archived", "read_state", "last_page",
+        "minutes_spent", "last_opened", "added_at", "updated_at",
+    ]
+    copy_cols = [c for c in target_cols if c in old_cols]
+    cols_csv = ",".join(copy_cols)
+    con.execute(f"INSERT INTO books_v02({cols_csv}) SELECT {cols_csv} FROM books")
+    con.execute("DROP TABLE books")
+    con.execute("ALTER TABLE books_v02 RENAME TO books")
+    create_book_indexes(con)
+    con.execute(
+        """
+        CREATE TABLE book_tags (
+          book_id INTEGER NOT NULL,
+          tag_id INTEGER NOT NULL,
+          PRIMARY KEY(book_id, tag_id),
+          FOREIGN KEY(book_id) REFERENCES books(id) ON DELETE CASCADE,
+          FOREIGN KEY(tag_id) REFERENCES tags(id) ON DELETE CASCADE
+        )
+        """
+    )
+    if tag_pairs:
+        valid_books = {r[0] for r in con.execute("SELECT id FROM books").fetchall()}
+        valid_tags = {r[0] for r in con.execute("SELECT id FROM tags").fetchall()}
+        pairs = [(b, t) for b, t in tag_pairs if b in valid_books and t in valid_tags]
+        con.executemany("INSERT OR IGNORE INTO book_tags(book_id,tag_id) VALUES(?,?)", pairs)
+
+
+def ensure_category(con: sqlite3.Connection, name: str) -> str:
+    name = re.sub(r"\s+", " ", (name or "").strip())[:120]
+    if not name:
+        name = "Uncategorized"
+    row = con.execute("SELECT name FROM categories WHERE name=? COLLATE NOCASE", (name,)).fetchone()
+    if row:
+        return row[0]
+    order = con.execute("SELECT COALESCE(MAX(sort_order),-1)+1 FROM categories").fetchone()[0]
+    con.execute(
+        "INSERT INTO categories(name,sort_order,visible,created_at) VALUES(?,?,1,?)",
+        (name, order, utc_now()),
+    )
+    return name
+
+
 def init_db():
     with write_lock, db() as con:
+        con.execute("PRAGMA foreign_keys=OFF")
         con.executescript(
             """
             CREATE TABLE IF NOT EXISTS users (
@@ -95,40 +218,16 @@ def init_db():
               expires_at REAL NOT NULL,
               FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
             );
-            CREATE TABLE IF NOT EXISTS books (
-              id INTEGER PRIMARY KEY AUTOINCREMENT,
-              rel_path TEXT NOT NULL UNIQUE,
-              title TEXT NOT NULL,
-              custom_title INTEGER NOT NULL DEFAULT 0,
-              category TEXT NOT NULL DEFAULT 'Dou' CHECK(category IN ('Novel','Manga','Dou')),
-              series TEXT,
-              volume TEXT,
-              cover_page INTEGER NOT NULL DEFAULT 1,
-              page_count INTEGER NOT NULL DEFAULT 0,
-              size INTEGER NOT NULL DEFAULT 0,
-              mtime REAL NOT NULL DEFAULT 0,
-              favorite INTEGER NOT NULL DEFAULT 0,
-              archived INTEGER NOT NULL DEFAULT 0,
-              read_state TEXT NOT NULL DEFAULT 'unread' CHECK(read_state IN ('unread','reading','read')),
-              last_page INTEGER NOT NULL DEFAULT 1,
-              minutes_spent REAL NOT NULL DEFAULT 0,
-              last_opened TEXT,
-              added_at TEXT NOT NULL,
-              updated_at TEXT NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS idx_books_category ON books(category);
-            CREATE INDEX IF NOT EXISTS idx_books_series ON books(series);
-            CREATE INDEX IF NOT EXISTS idx_books_title ON books(title);
             CREATE TABLE IF NOT EXISTS tags (
               id INTEGER PRIMARY KEY AUTOINCREMENT,
               name TEXT NOT NULL UNIQUE COLLATE NOCASE
             );
-            CREATE TABLE IF NOT EXISTS book_tags (
-              book_id INTEGER NOT NULL,
-              tag_id INTEGER NOT NULL,
-              PRIMARY KEY(book_id, tag_id),
-              FOREIGN KEY(book_id) REFERENCES books(id) ON DELETE CASCADE,
-              FOREIGN KEY(tag_id) REFERENCES tags(id) ON DELETE CASCADE
+            CREATE TABLE IF NOT EXISTS categories (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+              sort_order INTEGER NOT NULL DEFAULT 0,
+              visible INTEGER NOT NULL DEFAULT 1,
+              created_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS ignored_paths (
               rel_path TEXT PRIMARY KEY,
@@ -136,12 +235,38 @@ def init_db():
             );
             """
         )
+        migrate_books_if_needed(con)
+        con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS book_tags (
+              book_id INTEGER NOT NULL,
+              tag_id INTEGER NOT NULL,
+              PRIMARY KEY(book_id, tag_id),
+              FOREIGN KEY(book_id) REFERENCES books(id) ON DELETE CASCADE,
+              FOREIGN KEY(tag_id) REFERENCES tags(id) ON DELETE CASCADE
+            )
+            """
+        )
+        for r in con.execute("SELECT DISTINCT category FROM books WHERE category IS NOT NULL AND TRIM(category)<>''").fetchall():
+            ensure_category(con, r[0])
+        if con.execute("SELECT COUNT(*) FROM categories").fetchone()[0] == 0:
+            ensure_category(con, "Novel")
+            ensure_category(con, "Manga")
+        con.execute("PRAGMA foreign_keys=ON")
 
 
 def safe_path(rel_path: str) -> Path:
-    p = (LIBRARY_ROOT / rel_path).resolve()
+    clean = (rel_path or "").replace("\\", "/").lstrip("/")
+    p = (LIBRARY_ROOT / clean).resolve()
     if LIBRARY_ROOT != p and LIBRARY_ROOT not in p.parents:
         raise HTTPException(400, "Invalid path")
+    return p
+
+
+def safe_dir(rel_path: str) -> Path:
+    p = safe_path(rel_path)
+    if not p.exists() or not p.is_dir():
+        raise HTTPException(404, "Folder not found")
     return p
 
 
@@ -166,6 +291,16 @@ def guess_volume(title: str) -> str | None:
     return None
 
 
+def source_name_for_rel(rel: str) -> str:
+    parts = Path(rel).parts
+    return parts[0] if parts else "Uncategorized"
+
+
+def inferred_series_for_rel(rel: str) -> str | None:
+    parts = Path(rel).parts
+    return parts[1] if len(parts) >= 3 else None
+
+
 def pdf_page_count(path: Path) -> int:
     try:
         with fitz.open(path) as doc:
@@ -188,7 +323,7 @@ def tags_for_books(con: sqlite3.Connection, ids: list[int]) -> dict[int, list[st
         return out
     marks = ",".join("?" for _ in ids)
     rows = con.execute(
-        f"SELECT bt.book_id, t.name FROM book_tags bt JOIN tags t ON t.id=bt.tag_id WHERE bt.book_id IN ({marks}) ORDER BY t.name COLLATE NOCASE",
+        f"SELECT bt.book_id,t.name FROM book_tags bt JOIN tags t ON t.id=bt.tag_id WHERE bt.book_id IN ({marks}) ORDER BY t.name COLLATE NOCASE",
         ids,
     ).fetchall()
     for r in rows:
@@ -200,9 +335,18 @@ def book_to_dict(row: sqlite3.Row, tags: list[str] | None = None) -> dict[str, A
     d = dict(row)
     d["favorite"] = bool(d["favorite"])
     d["archived"] = bool(d["archived"])
+    d["missing"] = bool(d.get("missing_since"))
     d["tags"] = tags or []
     d["progress"] = round((d["last_page"] / d["page_count"] * 100), 1) if d["page_count"] else 0
     return d
+
+
+def clear_book_cache(book_id: int, thumbs_only: bool = False):
+    for p in (CACHE_DIR / "thumbs").glob(f"{book_id}-*.jpg"):
+        p.unlink(missing_ok=True)
+    if not thumbs_only:
+        shutil.rmtree(CACHE_DIR / "preview" / str(book_id), ignore_errors=True)
+        shutil.rmtree(CACHE_DIR / "pages" / str(book_id), ignore_errors=True)
 
 
 def render_page(book_id: int, page_num: int, width: int, kind: str) -> Path:
@@ -213,8 +357,7 @@ def render_page(book_id: int, page_num: int, width: int, kind: str) -> Path:
     page_num = max(1, min(page_num, max(row["page_count"], 1)))
     width = max(200, min(width, 2600))
     if kind == "thumb":
-        out_dir = CACHE_DIR / "thumbs"
-        outfile = out_dir / f"{book_id}-{page_num}-{width}.jpg"
+        outfile = CACHE_DIR / "thumbs" / f"{book_id}-{page_num}-{width}.jpg"
     elif kind == "preview":
         out_dir = CACHE_DIR / "preview" / str(book_id)
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -257,7 +400,8 @@ def thumb_worker():
         book_id = thumb_queue.get()
         try:
             row = book_row(book_id)
-            render_page(book_id, row["cover_page"], THUMB_WIDTH, "thumb")
+            if not row["missing_since"]:
+                render_page(book_id, row["cover_page"], THUMB_WIDTH, "thumb")
         except Exception:
             pass
         finally:
@@ -266,66 +410,150 @@ def thumb_worker():
             thumb_queue.task_done()
 
 
+def register_pdf(rel: str, *, restore_ignored: bool = False, category_override: str | None = None) -> str:
+    p = safe_path(rel)
+    if not p.exists() or not p.is_file() or p.suffix.lower() != ".pdf":
+        raise HTTPException(404, f"PDF not found: {rel}")
+    rel = p.relative_to(LIBRARY_ROOT).as_posix()
+    st = p.stat()
+    now = utc_now()
+    with write_lock, db() as con:
+        if restore_ignored:
+            con.execute("DELETE FROM ignored_paths WHERE rel_path=?", (rel,))
+        elif con.execute("SELECT 1 FROM ignored_paths WHERE rel_path=?", (rel,)).fetchone():
+            return "ignored"
+
+        old = con.execute("SELECT * FROM books WHERE rel_path=?", (rel,)).fetchone()
+        if old:
+            changed = old["size"] != st.st_size or abs(old["mtime"] - st.st_mtime) >= 0.001
+            restored = bool(old["missing_since"])
+            title = old["title"] if old["custom_title"] else filename_title(p)
+            pages = pdf_page_count(p) if changed or restored or old["page_count"] <= 0 else old["page_count"]
+            category = old["category"]
+            if category_override:
+                category = ensure_category(con, category_override)
+            con.execute(
+                "UPDATE books SET title=?,category=?,page_count=?,size=?,mtime=?,missing_since=NULL,updated_at=? WHERE id=?",
+                (title, category, pages, st.st_size, st.st_mtime, now, old["id"]),
+            )
+            if changed:
+                clear_book_cache(old["id"])
+            enqueue_thumb(int(old["id"]))
+            return "restored" if restored else ("updated" if changed else "kept")
+
+        source = source_name_for_rel(rel)
+        category = ensure_category(con, category_override or source)
+        title = filename_title(p)
+        series = inferred_series_for_rel(rel)
+        volume = guess_volume(title)
+        pages = pdf_page_count(p)
+        cur = con.execute(
+            """
+            INSERT INTO books(rel_path,title,category,series,volume,page_count,size,mtime,added_at,updated_at)
+            VALUES(?,?,?,?,?,?,?,?,?,?)
+            """,
+            (rel, title, category, series, volume, pages, st.st_size, st.st_mtime, now, now),
+        )
+        book_id = int(cur.lastrowid)
+    enqueue_thumb(book_id)
+    return "added"
+
+
+def purge_missing(*, force: bool = False) -> int:
+    cutoff = datetime.now(timezone.utc) - timedelta(days=MISSING_RETENTION_DAYS)
+    with write_lock, db() as con:
+        if force:
+            rows = con.execute("SELECT id FROM books WHERE missing_since IS NOT NULL").fetchall()
+        else:
+            rows = con.execute("SELECT id FROM books WHERE missing_since IS NOT NULL AND missing_since<=?", (cutoff.isoformat(),)).fetchall()
+        ids = [r[0] for r in rows]
+        if not ids:
+            return 0
+        marks = ",".join("?" for _ in ids)
+        con.execute(f"DELETE FROM books WHERE id IN ({marks})", ids)
+    for book_id in ids:
+        clear_book_cache(book_id)
+    return len(ids)
+
+
+def readable_source_dirs() -> tuple[list[Path], list[str]]:
+    if not LIBRARY_ROOT.exists() or not LIBRARY_ROOT.is_dir():
+        raise RuntimeError(f"Library path not found: {LIBRARY_ROOT}")
+    try:
+        children = [p for p in LIBRARY_ROOT.iterdir() if p.is_dir()]
+    except OSError as exc:
+        raise RuntimeError(f"Library path is not readable: {exc}") from exc
+    good: list[Path] = []
+    skipped: list[str] = []
+    for root in children:
+        try:
+            next(root.iterdir(), None)
+            good.append(root)
+        except (OSError, PermissionError):
+            skipped.append(root.name)
+    return good, skipped
+
+
 def perform_scan():
     global scan_state
     if not scan_lock.acquire(blocking=False):
         return
-    scan_state = {"running": True, "seen": 0, "added": 0, "updated": 0, "removed": 0, "error": None, "finished_at": None}
+    scan_state = {
+        "running": True,
+        "seen": 0,
+        "added": 0,
+        "updated": 0,
+        "missing": 0,
+        "restored": 0,
+        "purged": 0,
+        "sources_skipped": [],
+        "error": None,
+        "finished_at": None,
+    }
     try:
-        if not LIBRARY_ROOT.exists():
-            raise RuntimeError(f"Library path not found: {LIBRARY_ROOT}")
-        with db(readonly=True) as con:
-            ignored = {r[0] for r in con.execute("SELECT rel_path FROM ignored_paths").fetchall()}
-            existing = {r["rel_path"]: dict(r) for r in con.execute("SELECT * FROM books").fetchall()}
+        roots, skipped = readable_source_dirs()
+        scan_state["sources_skipped"] = skipped
+        successful_sources: set[str] = set()
         seen: set[str] = set()
-        for p in LIBRARY_ROOT.rglob("*"):
-            if not p.is_file() or p.suffix.lower() != ".pdf":
-                continue
-            rel = p.relative_to(LIBRARY_ROOT).as_posix()
-            if rel in ignored:
-                continue
-            seen.add(rel)
-            scan_state["seen"] += 1
-            st = p.stat()
-            old = existing.get(rel)
-            filename_name = filename_title(p)  # embedded PDF metadata is intentionally ignored
-            title = old["title"] if old and old.get("custom_title") else filename_name
-            if old and old["size"] == st.st_size and abs(old["mtime"] - st.st_mtime) < 0.001 and title == old["title"]:
-                continue
-            pages = pdf_page_count(p)
-            parts = Path(rel).parts
-            inferred_category = parts[0] if parts and parts[0] in {"Novel", "Manga", "Dou"} else (old["category"] if old else "Dou")
-            # Category comes from the mounted root folder. The first directory
-            # below the category is the series name; deeper folders can be arcs/parts
-            # without changing the logical series. Files directly under a category
-            # are standalone books.
-            inferred_series = None
-            if len(parts) >= 3 and parts[1] not in {"Novel", "Manga", "Dou"}:
-                inferred_series = parts[1]
-            volume = old["volume"] if old else guess_volume(filename_name)
-            now = utc_now()
-            with write_lock, db() as con:
-                if old:
-                    con.execute(
-                        "UPDATE books SET title=?, page_count=?, size=?, mtime=?, updated_at=? WHERE rel_path=?",
-                        (title, pages, st.st_size, st.st_mtime, now, rel),
-                    )
-                    book_id = old["id"]
-                    scan_state["updated"] += 1
-                else:
-                    cur = con.execute(
-                        "INSERT INTO books(rel_path,title,category,series,volume,page_count,size,mtime,added_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
-                        (rel, filename_name, inferred_category, inferred_series, volume, pages, st.st_size, st.st_mtime, now, now),
-                    )
-                    book_id = cur.lastrowid
-                    scan_state["added"] += 1
-            enqueue_thumb(int(book_id))
-        missing = [rel for rel in existing if rel not in seen]
-        if missing:
-            with write_lock, db() as con:
-                for rel in missing:
-                    con.execute("DELETE FROM books WHERE rel_path=?", (rel,))
-                    scan_state["removed"] += 1
+
+        for root in roots:
+            source_ok = True
+            try:
+                for p in root.rglob("*"):
+                    if not p.is_file() or p.suffix.lower() != ".pdf":
+                        continue
+                    rel = p.relative_to(LIBRARY_ROOT).as_posix()
+                    seen.add(rel)
+                    scan_state["seen"] += 1
+                    result = register_pdf(rel)
+                    if result == "added":
+                        scan_state["added"] += 1
+                    elif result == "updated":
+                        scan_state["updated"] += 1
+                    elif result == "restored":
+                        scan_state["restored"] += 1
+            except (OSError, PermissionError) as exc:
+                source_ok = False
+                scan_state["sources_skipped"].append(f"{root.name}: {exc}")
+            if source_ok:
+                successful_sources.add(root.name)
+                with write_lock, db() as con:
+                    ensure_category(con, root.name)
+
+        with db(readonly=True) as con:
+            existing = con.execute("SELECT id,rel_path,missing_since FROM books").fetchall()
+        newly_missing: list[int] = []
+        now = utc_now()
+        with write_lock, db() as con:
+            for row in existing:
+                source = source_name_for_rel(row["rel_path"])
+                if source not in successful_sources:
+                    continue
+                if row["rel_path"] not in seen and not row["missing_since"]:
+                    con.execute("UPDATE books SET missing_since=?,updated_at=? WHERE id=?", (now, now, row["id"]))
+                    newly_missing.append(row["id"])
+        scan_state["missing"] = len(newly_missing)
+        scan_state["purged"] = purge_missing(force=False)
         scan_state["finished_at"] = utc_now()
     except Exception as exc:
         scan_state["error"] = str(exc)
@@ -376,6 +604,11 @@ class LoginBody(BaseModel):
     password: str
 
 
+class ChangePasswordBody(BaseModel):
+    current_password: str = Field(min_length=1, max_length=256)
+    new_password: str = Field(min_length=10, max_length=256)
+
+
 class BookEdit(BaseModel):
     title: str | None = Field(default=None, min_length=1, max_length=500)
     category: str | None = None
@@ -397,6 +630,25 @@ class BulkBody(BaseModel):
 class ProgressBody(BaseModel):
     page: int = Field(ge=1)
     seconds: float = Field(default=0, ge=0, le=3600)
+
+
+class CategoryCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+
+
+class CategoryEdit(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=120)
+    visible: bool | None = None
+    sort_order: int | None = None
+
+
+class CategoryDelete(BaseModel):
+    move_to: str | None = None
+
+
+class ImportBody(BaseModel):
+    paths: list[str] = Field(min_length=1, max_length=1000)
+    category: str | None = None
 
 
 app = FastAPI(title=APP_NAME)
@@ -436,11 +688,28 @@ def sw():
 
 @app.get("/api/health")
 def health():
-    sources = {}
-    for category in ("Novel", "Manga", "Dou"):
-        root = LIBRARY_ROOT / category
-        sources[category] = {"path": str(root), "mounted": root.exists()}
-    return {"ok": True, "app": APP_NAME, "version": APP_VERSION, "library": str(LIBRARY_ROOT), "db": str(DB_PATH), "sources": sources}
+    sources: dict[str, Any] = {}
+    if LIBRARY_ROOT.exists():
+        try:
+            for root in LIBRARY_ROOT.iterdir():
+                if root.is_dir():
+                    try:
+                        next(root.iterdir(), None)
+                        readable = True
+                    except (OSError, PermissionError):
+                        readable = False
+                    sources[root.name] = {"path": str(root), "mounted": True, "readable": readable}
+        except OSError:
+            pass
+    return {
+        "ok": True,
+        "app": APP_NAME,
+        "version": APP_VERSION,
+        "library": str(LIBRARY_ROOT),
+        "db": str(DB_PATH),
+        "missing_retention_days": MISSING_RETENTION_DAYS,
+        "sources": sources,
+    }
 
 
 @app.get("/api/auth/status")
@@ -479,6 +748,25 @@ def login(body: LoginBody, response: Response):
     return {"ok": True, "username": row["username"]}
 
 
+@app.post("/api/auth/change-password", dependencies=[Depends(require_ajax)])
+def change_password(body: ChangePasswordBody, request: Request):
+    user = require_user(request)
+    with db(readonly=True) as con:
+        row = con.execute("SELECT password_hash FROM users WHERE id=?", (user["id"],)).fetchone()
+    if not row:
+        raise HTTPException(404, "User not found")
+    try:
+        ph.verify(row["password_hash"], body.current_password)
+    except VerifyMismatchError:
+        raise HTTPException(401, "Current password is incorrect")
+    current_token = request.cookies.get("nas_reader_session")
+    current_hash = hashlib.sha256(current_token.encode()).hexdigest() if current_token else ""
+    with write_lock, db() as con:
+        con.execute("UPDATE users SET password_hash=? WHERE id=?", (ph.hash(body.new_password), user["id"]))
+        con.execute("DELETE FROM sessions WHERE user_id=? AND token_hash<>?", (user["id"], current_hash))
+    return {"ok": True}
+
+
 @app.post("/api/auth/logout", dependencies=[Depends(require_ajax)])
 def logout(request: Request, response: Response):
     token = request.cookies.get("nas_reader_session")
@@ -487,6 +775,79 @@ def logout(request: Request, response: Response):
             con.execute("DELETE FROM sessions WHERE token_hash=?", (hashlib.sha256(token.encode()).hexdigest(),))
     response.delete_cookie("nas_reader_session", path="/")
     return {"ok": True}
+
+
+def categories_payload(con: sqlite3.Connection) -> list[dict[str, Any]]:
+    counts = {r[0]: r[1] for r in con.execute("SELECT category,COUNT(*) FROM books WHERE missing_since IS NULL GROUP BY category").fetchall()}
+    rows = con.execute("SELECT * FROM categories ORDER BY sort_order,name COLLATE NOCASE").fetchall()
+    return [
+        {"id": r["id"], "name": r["name"], "sort_order": r["sort_order"], "visible": bool(r["visible"]), "count": counts.get(r["name"], 0)}
+        for r in rows
+    ]
+
+
+@app.get("/api/categories")
+def list_categories(request: Request):
+    require_user(request)
+    with db(readonly=True) as con:
+        return categories_payload(con)
+
+
+@app.post("/api/categories", dependencies=[Depends(require_ajax)])
+def create_category(body: CategoryCreate, request: Request):
+    require_user(request)
+    name = re.sub(r"\s+", " ", body.name.strip())
+    with write_lock, db() as con:
+        if con.execute("SELECT 1 FROM categories WHERE name=? COLLATE NOCASE", (name,)).fetchone():
+            raise HTTPException(409, "Category already exists")
+        ensure_category(con, name)
+        return categories_payload(con)
+
+
+@app.patch("/api/categories/{category_id}", dependencies=[Depends(require_ajax)])
+def edit_category(category_id: int, body: CategoryEdit, request: Request):
+    require_user(request)
+    data = body.model_dump(exclude_unset=True)
+    with write_lock, db() as con:
+        row = con.execute("SELECT * FROM categories WHERE id=?", (category_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "Category not found")
+        new_name = row["name"]
+        if "name" in data:
+            new_name = re.sub(r"\s+", " ", data["name"].strip())
+            dupe = con.execute("SELECT id FROM categories WHERE name=? COLLATE NOCASE AND id<>?", (new_name, category_id)).fetchone()
+            if dupe:
+                raise HTTPException(409, "Category already exists")
+            con.execute("UPDATE books SET category=?,updated_at=? WHERE category=?", (new_name, utc_now(), row["name"]))
+        con.execute(
+            "UPDATE categories SET name=?,visible=?,sort_order=? WHERE id=?",
+            (
+                new_name,
+                int(data.get("visible", bool(row["visible"]))),
+                int(data.get("sort_order", row["sort_order"])),
+                category_id,
+            ),
+        )
+        return categories_payload(con)
+
+
+@app.post("/api/categories/{category_id}/delete", dependencies=[Depends(require_ajax)])
+def delete_category(category_id: int, body: CategoryDelete, request: Request):
+    require_user(request)
+    with write_lock, db() as con:
+        row = con.execute("SELECT * FROM categories WHERE id=?", (category_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "Category not found")
+        count = con.execute("SELECT COUNT(*) FROM books WHERE category=?", (row["name"],)).fetchone()[0]
+        if count:
+            if not body.move_to:
+                raise HTTPException(409, f"Category contains {count} books; choose a destination first")
+            target = con.execute("SELECT name FROM categories WHERE name=? COLLATE NOCASE", (body.move_to,)).fetchone()
+            if not target or target[0].casefold() == row["name"].casefold():
+                raise HTTPException(400, "Invalid destination category")
+            con.execute("UPDATE books SET category=?,updated_at=? WHERE category=?", (target[0], utc_now(), row["name"]))
+        con.execute("DELETE FROM categories WHERE id=?", (category_id,))
+        return categories_payload(con)
 
 
 @app.get("/api/library")
@@ -500,7 +861,7 @@ def library(
     favorites: bool = False,
 ):
     require_user(request)
-    where = ["1=1"]
+    where = ["missing_since IS NULL"]
     params: list[Any] = []
     if q:
         where.append("(title LIKE ? OR rel_path LIKE ? OR series LIKE ?)")
@@ -519,8 +880,11 @@ def library(
     with db(readonly=True) as con:
         rows = con.execute(f"SELECT * FROM books WHERE {' AND '.join(where)}", params).fetchall()
         tag_map = tags_for_books(con, [r["id"] for r in rows])
-        series_rows = con.execute("SELECT category,COALESCE(series,'') AS series,COUNT(*) n FROM books GROUP BY category,series ORDER BY series COLLATE NOCASE").fetchall()
-        category_rows = con.execute("SELECT category,COUNT(*) n FROM books WHERE archived=0 GROUP BY category").fetchall()
+        series_rows = con.execute(
+            "SELECT category,COALESCE(series,'') AS series,COUNT(*) n FROM books WHERE missing_since IS NULL GROUP BY category,series ORDER BY series COLLATE NOCASE"
+        ).fetchall()
+        categories = categories_payload(con)
+        missing_count = con.execute("SELECT COUNT(*) FROM books WHERE missing_since IS NOT NULL").fetchone()[0]
     books = [book_to_dict(r, tag_map.get(r["id"], [])) for r in rows]
     if sort == "added":
         books.sort(key=lambda x: x["added_at"], reverse=True)
@@ -535,9 +899,11 @@ def library(
     return {
         "books": books,
         "series": [{"category": r["category"], "series": r["series"], "count": r["n"]} for r in series_rows if r["series"]],
-        "category_counts": {r["category"]: r["n"] for r in category_rows},
-        "total_count": sum(r["n"] for r in category_rows),
+        "categories": categories,
+        "total_count": sum(c["count"] for c in categories),
         "count": len(books),
+        "missing_count": missing_count,
+        "missing_retention_days": MISSING_RETENTION_DAYS,
         "scan": scan_state,
         "allow_delete_files": ALLOW_DELETE_FILES,
     }
@@ -556,12 +922,16 @@ def get_book(book_id: int, request: Request):
 def edit_book(book_id: int, body: BookEdit, request: Request):
     require_user(request)
     row = book_row(book_id)
-    updates = []
+    updates: list[str] = []
     params: list[Any] = []
     data = body.model_dump(exclude_unset=True)
     tags = data.pop("tags", None)
-    if "category" in data and data["category"] not in {"Novel", "Manga", "Dou"}:
-        raise HTTPException(400, "Invalid category")
+    if "category" in data:
+        with db(readonly=True) as con:
+            cat = con.execute("SELECT name FROM categories WHERE name=? COLLATE NOCASE", (data["category"],)).fetchone()
+        if not cat:
+            raise HTTPException(400, "Invalid category")
+        data["category"] = cat[0]
     if "read_state" in data and data["read_state"] not in {"unread", "reading", "read"}:
         raise HTTPException(400, "Invalid read state")
     for key, val in data.items():
@@ -591,6 +961,17 @@ def edit_book(book_id: int, body: BookEdit, request: Request):
     return get_book(book_id, request)
 
 
+@app.post("/api/books/{book_id}/reset-title", dependencies=[Depends(require_ajax)])
+def reset_title(book_id: int, request: Request):
+    require_user(request)
+    row = book_row(book_id)
+    p = safe_path(row["rel_path"])
+    title = filename_title(p)
+    with write_lock, db() as con:
+        con.execute("UPDATE books SET title=?,custom_title=0,updated_at=? WHERE id=?", (title, utc_now(), book_id))
+    return get_book(book_id, request)
+
+
 @app.post("/api/bulk", dependencies=[Depends(require_ajax)])
 def bulk(body: BulkBody, request: Request):
     require_user(request)
@@ -603,9 +984,10 @@ def bulk(body: BulkBody, request: Request):
         if len(rows) != len(ids):
             raise HTTPException(404, "Some books no longer exist")
         if action == "category":
-            if value not in {"Novel", "Manga", "Dou"}:
+            cat = con.execute("SELECT name FROM categories WHERE name=? COLLATE NOCASE", (str(value),)).fetchone()
+            if not cat:
                 raise HTTPException(400, "Invalid category")
-            con.execute(f"UPDATE books SET category=?,updated_at=? WHERE id IN ({marks})", [value, utc_now(), *ids])
+            con.execute(f"UPDATE books SET category=?,updated_at=? WHERE id IN ({marks})", [cat[0], utc_now(), *ids])
         elif action == "series":
             val = str(value).strip() if value is not None else ""
             con.execute(f"UPDATE books SET series=?,updated_at=? WHERE id IN ({marks})", [val or None, utc_now(), *ids])
@@ -650,10 +1032,11 @@ def bulk(body: BulkBody, request: Request):
             pass
         else:
             raise HTTPException(400, "Unknown bulk action")
-    if action == "regen_preview":
+    if action in {"regen_preview", "remove_library", "delete_files"}:
         for i in ids:
             clear_book_cache(i)
-            enqueue_thumb(i)
+            if action == "regen_preview":
+                enqueue_thumb(i)
     return {"ok": True, "count": len(ids)}
 
 
@@ -669,14 +1052,6 @@ def save_progress(book_id: int, body: ProgressBody, request: Request):
             (page, state, body.seconds / 60.0, utc_now(), utc_now(), book_id),
         )
     return {"ok": True, "page": page, "read_state": state}
-
-
-def clear_book_cache(book_id: int, thumbs_only: bool = False):
-    for p in (CACHE_DIR / "thumbs").glob(f"{book_id}-*.jpg"):
-        p.unlink(missing_ok=True)
-    if not thumbs_only:
-        shutil.rmtree(CACHE_DIR / "preview" / str(book_id), ignore_errors=True)
-        shutil.rmtree(CACHE_DIR / "pages" / str(book_id), ignore_errors=True)
 
 
 @app.get("/api/books/{book_id}/thumb")
@@ -726,6 +1101,64 @@ def scan(request: Request):
 def scan_status(request: Request):
     require_user(request)
     return scan_state
+
+
+@app.post("/api/missing/clean", dependencies=[Depends(require_ajax)])
+def clean_missing(request: Request):
+    require_user(request)
+    if scan_state.get("running"):
+        raise HTTPException(409, "Wait for the current rescan to finish")
+    return {"ok": True, "purged": purge_missing(force=True)}
+
+
+@app.get("/api/import/browse")
+def import_browse(request: Request, path: str = ""):
+    require_user(request)
+    root = safe_dir(path)
+    rel_root = "" if root == LIBRARY_ROOT else root.relative_to(LIBRARY_ROOT).as_posix()
+    dirs: list[dict[str, str]] = []
+    pdfs: list[dict[str, Any]] = []
+    try:
+        entries = sorted(root.iterdir(), key=lambda p: natural_key(p.name))
+    except (OSError, PermissionError) as exc:
+        raise HTTPException(403, f"Folder is not readable: {exc}")
+    with db(readonly=True) as con:
+        indexed = {r[0] for r in con.execute("SELECT rel_path FROM books WHERE missing_since IS NULL").fetchall()}
+    for p in entries:
+        rel = p.relative_to(LIBRARY_ROOT).as_posix()
+        if p.is_dir():
+            dirs.append({"name": p.name, "path": rel})
+        elif p.is_file() and p.suffix.lower() == ".pdf":
+            pdfs.append({"name": p.name, "path": rel, "indexed": rel in indexed})
+    parent = ""
+    if rel_root:
+        parent_path = Path(rel_root).parent
+        parent = "" if str(parent_path) == "." else parent_path.as_posix()
+    return {"path": rel_root, "parent": parent, "dirs": dirs, "pdfs": pdfs}
+
+
+@app.post("/api/import", dependencies=[Depends(require_ajax)])
+def import_paths(body: ImportBody, request: Request):
+    require_user(request)
+    if scan_state.get("running"):
+        raise HTTPException(409, "Wait for the current rescan to finish")
+    added = updated = restored = kept = 0
+    errors: list[str] = []
+    with scan_lock:
+        for rel in list(dict.fromkeys(body.paths)):
+            try:
+                result = register_pdf(rel, restore_ignored=True, category_override=body.category)
+                if result == "added":
+                    added += 1
+                elif result == "updated":
+                    updated += 1
+                elif result == "restored":
+                    restored += 1
+                else:
+                    kept += 1
+            except HTTPException as exc:
+                errors.append(f"{rel}: {exc.detail}")
+    return {"ok": not errors, "added": added, "updated": updated, "restored": restored, "kept": kept, "errors": errors[:20]}
 
 
 @app.get("/api/tags")

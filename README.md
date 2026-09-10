@@ -2,64 +2,63 @@
 
 A lightweight, NAS-first PDF library and reader designed for large personal collections and touch-first use on iPad.
 
-Version: **0.1.0**
+Version: **0.2.0**
 
 ## Why this exists
 
-The app keeps original PDFs in their existing folders instead of uploading/copying them into an application-managed library. It indexes files, stores reading state in SQLite, and caches thumbnails/previews separately.
+The app keeps original PDFs in their existing NAS folders. It indexes the existing paths, stores library metadata and reading state in SQLite, and keeps generated thumbnails/previews in a separate cache. Importing a PDF never copies the source file.
 
-Key design goals:
+## Highlights in v0.2.0
 
-- filename is the source of truth for the displayed title;
-- direct folder scanning instead of browser bulk uploads;
-- separate `Novel`, `Manga`, and `Dou` categories;
-- optional series grouping inside each category;
-- large-library friendly multi-select and bulk actions;
-- touch-friendly iPad UI;
-- cached covers/previews so the library view does not repeatedly render PDFs;
-- source PDFs are read-only by default;
-- suitable for private LAN or Tailscale access.
+- Tap a book card to resume reading immediately; use the three-dot button for details/editing.
+- iPad-first full-screen reader with `Fit page` and `Fit width`.
+- Single page, real double-page spread, vertical, LTR and RTL modes.
+- Auto-hiding reader controls, loading state, neighboring-page preload and swipe navigation.
+- Dynamic categories: create, rename, hide and remove them from Settings.
+- NAS Import browser: register selected existing PDFs without duplicating them.
+- Rescan uses the PDF path as identity. Existing paths keep user-edited metadata and progress.
+- If a file disappears, its record is hidden immediately and kept for 14 days by default before cleanup.
+- If the same path returns during the grace period, its metadata/progress is restored.
+- If a PDF is renamed, the old path becomes missing and the new path is indexed as a new book.
+- A mounted source that cannot be read is never treated as an empty folder, preventing accidental mass-missing state.
+- Password can be changed from Settings.
+- v0.1 databases migrate in place.
 
-## Features in v0.1.0
+## Library model
 
-- Scan PDF folders directly from the host/NAS.
-- Category tabs: `All`, `Novel`, `Manga`, `Dou`.
-- Series and standalone-book views.
-- Natural sorting for numbered volumes.
-- Search and series filtering.
-- Cover thumbnail cache and quick preview cache.
-- Continue-reading state and page progress.
-- Favorite, archive, and read-state tracking.
-- Reader modes for single page, vertical, double page, and RTL.
-- iPad/touch support, including long-press selection.
-- Desktop Shift-click range selection.
-- Bulk actions for category, series, tags, read state, favorites, archive, preview regeneration, and removal from the index.
-- Optional permanent source-file deletion, disabled by default.
-- Single-admin local authentication with Argon2 password hashing.
-- SQLite configured with WAL mode, busy timeout, and serialized writes.
-- One preview-render worker to avoid hammering NAS storage.
+Docker mounts source folders below `/library`. The first folder name is used only as the **initial category** for newly discovered PDFs. Afterwards, the logical category can be changed freely in the app without moving the PDF.
 
-## Folder model
-
-Each category may live in a completely different location on the host. Docker normalizes them inside the container:
+Example:
 
 ```text
-<host novel folder>  -> /library/Novel
-<host manga folder>  -> /library/Manga
-<host dou folder>    -> /library/Dou
+/library/Novel/Example Series/Example Series 01.pdf
+/library/Manga/Another Series/Another Series 01.pdf
 ```
 
-A folder directly below a category is treated as a series:
+For a new PDF, the scanner initially infers:
 
 ```text
-Manga/
-└── Example Series/
-    ├── Example Series 01.pdf
-    ├── Example Series 02.pdf
-    └── Example Series 10.pdf
+source folder: Novel
+category: Novel
+series: Example Series
 ```
 
-A PDF directly inside a category root is treated as standalone.
+Changing the category in the app does not rename or move the source file.
+
+## Import vs Rescan
+
+**Import** lets you browse mounted NAS folders and register selected PDFs immediately. It stores only the existing relative path; no PDF is uploaded or copied.
+
+**Rescan** synchronizes the index with all readable mounted source folders:
+
+```text
+existing path -> keep metadata/progress, refresh technical file info if needed
+new path      -> add
+missing path  -> hide and start the grace period
+unreadable source -> skip missing detection for that source
+```
+
+Missing records are retained for `MISSING_RETENTION_DAYS` (default `14`) and then purged together with their generated cache. Settings also provides a manual `Clean missing paths now` action.
 
 ## Docker setup
 
@@ -69,7 +68,7 @@ Copy the example configuration:
 cp .env.example .env
 ```
 
-Edit `.env` for your machine. For example:
+Edit `.env` for your machine:
 
 ```env
 PUID=1000
@@ -78,19 +77,25 @@ PORT=8020
 
 NOVEL_PATH=/path/to/novels
 MANGA_PATH=/path/to/manga
-DOU_PATH=/path/to/dou
 
 LIBRARY_ACCESS=ro
 ALLOW_DELETE_FILES=false
+MISSING_RETENTION_DAYS=14
 ```
+
+Add additional source mounts in `docker-compose.yml` when needed, for example:
+
+```yaml
+- "/path/to/artbooks:/library/Artbook:ro"
+```
+
+The next Rescan will discover the PDFs and create `Artbook` as an initial logical category if it does not exist yet.
 
 On Linux/NAS systems, find the UID/GID of the account that can read the library folders with:
 
 ```bash
 id your-user
 ```
-
-The container starts as root only long enough to prepare `/data` and `/cache`, then drops to the configured `PUID:PGID` before running the web app. This avoids manual `chown` steps for runtime folders while still allowing access to protected NAS home folders when the correct IDs are supplied.
 
 Build and start:
 
@@ -104,69 +109,48 @@ Open:
 http://<server-ip>:8020
 ```
 
-On first run, create the single administrator account, then scan the library.
-
-## Running on Synology
-
-You can create a Container Manager project from this repository's `docker-compose.yml`. Put machine-specific paths and UID/GID values in `.env`; do not edit them into the repository copy.
-
-If a source category is not currently used, leave its path pointing at the included empty local folder, for example:
-
-```env
-MANGA_PATH=./library/Manga
-```
+On first run, create the single administrator account.
 
 ## Source-file safety
 
-The default configuration mounts PDF sources read-only:
+The default configuration is read-only:
 
 ```env
 LIBRARY_ACCESS=ro
 ALLOW_DELETE_FILES=false
 ```
 
-`Remove from library` only removes an item from the index. It does not delete the source PDF.
+`Remove from library` removes only the index record and ignores that exact path on future rescans until you explicitly Import it again.
 
-Permanent source-file deletion requires both:
+Permanent source-file deletion requires both a read-write mount and `ALLOW_DELETE_FILES=true`.
 
-```env
-LIBRARY_ACCESS=rw
-ALLOW_DELETE_FILES=true
+## Data locations
+
+The app writes only to:
+
+```text
+./data   -> SQLite database, library metadata and reading state
+./cache  -> generated thumbnails, previews and rendered pages
 ```
 
-and an explicit confirmation in the UI.
+Original PDFs stay in the mounted source folders.
 
 ## Private remote access
 
-This app is intended for private access. A common setup is to keep the service off the public internet and reach the NAS through Tailscale or another private VPN.
+The intended deployment is private LAN or private VPN/Tailscale access rather than direct public exposure.
 
-When using plain HTTP inside a private network, keep:
+For plain HTTP on a private network:
 
 ```env
 COOKIE_SECURE=false
 ```
 
-When placing the app behind HTTPS, set:
+Behind HTTPS:
 
 ```env
 COOKIE_SECURE=true
 ```
 
-## Data locations
-
-The application writes only to:
-
-```text
-./data   -> SQLite database and reading state
-./cache  -> generated thumbnails/previews/pages
-```
-
-Original PDF files remain in the mounted source folders.
-
 ## Git safety
 
-Runtime data and machine-specific configuration are intentionally excluded from Git. Do not commit `.env`, SQLite databases, source PDFs, keys, certificates, credentials, or tokens.
-
-## Status
-
-v0.1.0 is an early release intended for personal/self-hosted testing. Back up important data and keep source PDFs read-only until you are comfortable with the deployment.
+Do not commit `.env`, SQLite databases, source PDFs, cache contents, keys, certificates, credentials, tokens, or machine-specific private paths.

@@ -24,18 +24,14 @@
 <header class="topbar">
   <div class="brand"><strong>NAS PDF Reader</strong><span id="countBadge" class="badge"></span></div>
   <div class="header-actions">
-    <button id="scanBtn" title="Scan NAS folders">↻ Scan</button>
+    <button id="importBtn" title="Register existing PDFs from NAS">＋ Import</button>
+    <button id="scanBtn" title="Rescan mounted NAS folders">↻ Rescan</button>
     <button id="selectBtn">Select</button>
-    <button id="logoutBtn">Logout</button>
+    <button id="settingsBtn" aria-label="Settings">⚙︎</button>
   </div>
 </header>
 
-<nav class="categories" id="categoryTabs">
-  <button data-category="" class="active">All <span data-count="All"></span></button>
-  <button data-category="Novel">Novel <span data-count="Novel"></span></button>
-  <button data-category="Manga">Manga <span data-count="Manga"></span></button>
-  <button data-category="Dou">Dou <span data-count="Dou"></span></button>
-</nav>
+<nav class="categories" id="categoryTabs"></nav>
 
 <section class="filters">
   <input id="search" type="search" placeholder="Search title / path / series…" />

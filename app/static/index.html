@@ -4,10 +4,11 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
   <meta name="theme-color" content="#111827" />
+  <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
   <meta name="apple-mobile-web-app-capable" content="yes" />
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
   <link rel="manifest" href="/manifest.webmanifest" />
-  <link rel="stylesheet" href="/static/style.css" />
+  <link rel="stylesheet" href="/static/style.css?v=0.3.4" />
   <title>NAS PDF Reader</title>
 </head>
 <body>
@@ -24,7 +25,7 @@
 <header class="topbar">
   <div class="brand"><strong>NAS PDF Reader</strong><span id="countBadge" class="badge"></span></div>
   <div class="header-actions">
-    <button id="importBtn" title="Register existing PDFs from NAS">＋ Import</button>
+    <button id="importBtn" title="Register existing PDF / EPUB files from NAS">＋ Import</button>
     <button id="scanBtn" title="Rescan mounted NAS folders">↻ Rescan</button>
     <button id="selectBtn">Select</button>
     <button id="settingsBtn" aria-label="Settings">⚙︎</button>
@@ -34,7 +35,7 @@
 <nav class="categories" id="categoryTabs"></nav>
 
 <section class="filters">
-  <input id="search" type="search" placeholder="Search title / path / series…" />
+  <input id="search" type="search" placeholder="Search title / series / tags…" />
   <select id="seriesFilter"><option value="">All series</option></select>
   <select id="sort">
     <option value="title">Title</option>
@@ -78,6 +79,7 @@
 
 <div id="modal" class="modal hidden"><div class="modal-sheet"><button class="modal-x" id="modalX">✕</button><div id="modalBody"></div></div></div>
 <div id="toast" class="toast hidden"></div>
-<script src="/static/app.js"></script>
+<script src="/static/reading-cache.js?v=0.3.4"></script>
+<script src="/static/app.js?v=0.3.4"></script>
 </body>
 </html>

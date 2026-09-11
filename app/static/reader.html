@@ -4,44 +4,87 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
   <meta name="theme-color" content="#05070a">
-  <link rel="stylesheet" href="/static/style.css">
+  <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+  <link rel="stylesheet" href="/static/style.css?v=0.3.4">
   <title>Reader</title>
 </head>
-<body class="reader-body">
+<body class="reader-body controls-hidden">
+<button id="uiToggleBtn" class="ui-toggle" aria-label="Show reader UI" aria-pressed="false">UI</button>
+
 <header class="reader-top reader-control">
-  <a href="/" class="back">‹ Library</a>
+  <a href="/" id="readerBackBtn" class="back">‹ Library</a>
   <div id="readerTitle" class="reader-title"></div>
   <div class="reader-toolbar">
-    <div class="reader-segment" id="modeSegment">
-      <button data-mode="single">Single</button>
-      <button data-mode="double">Double</button>
-      <button data-mode="vertical">Vertical</button>
+    <div id="pdfControls" class="reader-toolbar-group">
+      <div class="reader-segment" id="modeSegment">
+        <button data-mode="single">Single</button>
+        <button data-mode="double">Double</button>
+        <button data-mode="vertical">Vertical</button>
+      </div>
+      <div class="reader-segment" id="fitSegment">
+        <button data-fit="page">Fit page</button>
+        <button data-fit="width">Fit width</button>
+      </div>
+      <div class="reader-segment" id="dirSegment">
+        <button data-dir="ltr">LTR</button>
+        <button data-dir="rtl">RTL</button>
+      </div>
     </div>
-    <div class="reader-segment" id="fitSegment">
-      <button data-fit="page">Fit page</button>
-      <button data-fit="width">Fit width</button>
-    </div>
-    <div class="reader-segment" id="dirSegment">
-      <button data-dir="ltr">LTR</button>
-      <button data-dir="rtl">RTL</button>
+    <div id="epubControls" class="reader-toolbar-group hidden">
+      <div class="reader-segment epub-text-controls" aria-label="Text size">
+        <button id="fontDownBtn" title="Smaller text">A−</button>
+        <button id="fontUpBtn" title="Larger text">A＋</button>
+      </div>
+      <div class="reader-segment epub-text-controls" aria-label="Line spacing">
+        <button id="lineDownBtn" title="Tighter lines">↕−</button>
+        <button id="lineUpBtn" title="Looser lines">↕＋</button>
+      </div>
+      <select id="epubTheme" class="reader-select" aria-label="EPUB theme">
+        <option value="paper">Paper</option>
+        <option value="dark">Dark</option>
+        <option value="sepia">Sepia</option>
+      </select>
+      <button id="tocBtn">TOC</button>
     </div>
     <button id="readerMoreBtn" class="reader-more">•••</button>
   </div>
 </header>
 
 <div id="readerMoreMenu" class="reader-more-menu hidden reader-control">
-  <a id="downloadBtn" class="button-link" download>Download PDF</a>
+  <a id="downloadBtn" class="button-link" download>Download book</a>
 </div>
 
-<div id="loadingPage" class="reader-loading"><span class="spinner"></span><span>Loading page…</span></div>
-<div id="reader" class="reader single fit-page"></div>
+<div id="loadingPage" class="reader-loading"><span class="spinner"></span><span id="loadingText">Loading page…</span></div>
+<div id="reader" class="reader paged single fit-page"></div>
+
+<aside id="epubToc" class="epub-toc hidden reader-control" aria-label="Table of contents">
+  <div class="epub-toc-head"><strong>Table of contents</strong><button id="tocCloseBtn" aria-label="Close">✕</button></div>
+  <div id="epubTocList" class="epub-toc-list"></div>
+</aside>
+
+<div id="filmstrip" class="reader-filmstrip reader-control">
+  <div id="filmstripScroller" class="filmstrip-scroller"><div id="filmstripInner" class="filmstrip-inner"></div></div>
+</div>
 
 <div class="reader-bottom reader-control">
   <button id="prevBtn" aria-label="Previous">‹</button>
   <div><span id="pageText">1 / 1</span><input id="pageSlider" type="range" min="1" max="1" value="1"></div>
   <button id="nextBtn" aria-label="Next">›</button>
 </div>
-<div id="readerToast" class="toast hidden"></div>
-<script src="/static/reader.js"></script>
+
+<div id="nextVolumePrompt" class="reader-prompt hidden" role="dialog" aria-modal="true" aria-labelledby="nextVolumeTitle">
+  <div class="reader-prompt-card">
+    <h2 id="nextVolumeTitle">อ่านเล่มนี้จบแล้ว</h2>
+    <p>ต้องการไปเล่มถัดไปของ Series นี้ไหม?</p>
+    <div id="nextVolumeName" class="reader-prompt-next"></div>
+    <div class="reader-prompt-actions">
+      <button id="nextVolumeStayBtn" type="button">ยังไม่ไป</button>
+      <button id="nextVolumeGoBtn" type="button" class="primary">ไปเล่มถัดไป</button>
+    </div>
+  </div>
+</div>
+<script src="/static/jszip.min.js?v=0.3.4"></script>
+<script src="/static/reading-cache.js?v=0.3.4"></script>
+<script src="/static/reader.js?v=0.3.4"></script>
 </body>
 </html>

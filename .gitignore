@@ -9,14 +9,9 @@
 /cache/*
 !/cache/.gitkeep
 
-# Local sample library content
-/library/**/*
-!/library/Novel/
-!/library/Novel/.gitkeep
-!/library/Manga/
-!/library/Manga/.gitkeep
-!/library/Dou/
-!/library/Dou/.gitkeep
+# Local library content
+/library/*
+!/library/.gitkeep
 
 # Databases and journals
 *.sqlite

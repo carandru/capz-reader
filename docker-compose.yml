@@ -1,7 +1,7 @@
 services:
   reader:
     build: .
-    container_name: nas-pdf-reader
+    container_name: nas-reader
     restart: unless-stopped
     ports:
       - "${PORT:-8020}:8000"
@@ -17,10 +17,11 @@ services:
       THUMB_WIDTH: "${THUMB_WIDTH:-320}"
       PREVIEW_WIDTH: "${PREVIEW_WIDTH:-760}"
       READER_WIDTH: "${READER_WIDTH:-1800}"
+      RENDER_CACHE_DAYS: "${RENDER_CACHE_DAYS:-30}"
+      RENDER_CACHE_LIMIT_GB: "${RENDER_CACHE_LIMIT_GB:-8}"
       PUID: "${PUID:-1000}"
       PGID: "${PGID:-1000}"
     volumes:
-      - "${NOVEL_PATH:-./library/Novel}:/library/Novel:${LIBRARY_ACCESS:-ro}"
-      - "${MANGA_PATH:-./library/Manga}:/library/Manga:${LIBRARY_ACCESS:-ro}"
+      - "${LIBRARY_PATH:-./library}:/library:${LIBRARY_ACCESS:-ro}"
       - ./data:/data
       - ./cache:/cache

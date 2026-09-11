@@ -20,14 +20,40 @@ const api = async (url, opt={}) => {
   return r.json();
 };
 
+// Thai-aware, numeric collation for all user-visible book/series ordering.
+// Intl.Collator follows CLDR Thai collation rules (including leading vowels such as เ แ โ ใ ไ)
+// and numeric:true keeps 2 before 10.
+const THAI_COLLATOR = new Intl.Collator('th-TH', {numeric:true, sensitivity:'base'});
+const compareText = (a='', b='') => THAI_COLLATOR.compare(String(a ?? ''), String(b ?? ''));
+function compareBooksForSort(a,b,sort=state.sort){
+  if(sort==='series'){
+    return compareText(a.series,b.series) || compareText(a.volume || a.title,b.volume || b.title) || compareText(a.title,b.title);
+  }
+  if(sort==='title') return compareText(a.title,b.title);
+  return 0;
+}
+function sortBooksForUi(books,sort=state.sort){
+  if(sort==='title' || sort==='series') books.sort((a,b)=>compareBooksForSort(a,b,sort));
+  return books;
+}
+
+const initialParams = new URLSearchParams(location.search);
+const initialSeries = initialParams.get('series') || '';
+const urlCategory = initialParams.get('category') || '';
+const initialSeriesCategory = initialSeries ? urlCategory : '';
+const initialCategory = initialSeries ? (localStorage.getItem('nasreader.category') || '') : (initialParams.has('category') ? urlCategory : (localStorage.getItem('nasreader.category') || ''));
+const initialView = initialSeries ? 'books' : (initialParams.get('view') || localStorage.getItem('nasreader.view') || 'books');
+
 let state = {
   books: [], allSeries: [], categories: [], selected: new Set(), selection: false,
-  category: localStorage.getItem('nasreader.category') || '', q: '', series: '',
+  category: initialCategory, q: '', series: initialSeries, seriesCategory: initialSeriesCategory,
   sort: localStorage.getItem('nasreader.sort') || 'title',
-  view: localStorage.getItem('nasreader.view') || 'books',
+  view: initialView,
   allowDelete: false, longPress: null, lastSelected: null, suppressClick: null,
   missingCount: 0, missingRetention: 14, username: ''
 };
+let loadController = null;
+let loadSeq = 0;
 
 const toast = m => {
   const t = $('#toast');
@@ -36,6 +62,54 @@ const toast = m => {
   clearTimeout(toast.t);
   toast.t = setTimeout(() => t.classList.add('hidden'), 2400);
 };
+
+function libraryUrlForCurrentState() {
+  const p = new URLSearchParams();
+  if (state.series) {
+    p.set('series', state.series);
+    if (state.seriesCategory || state.category) p.set('category', state.seriesCategory || state.category);
+    p.set('view', 'books');
+  }
+  return '/' + (p.toString() ? `?${p.toString()}` : '');
+}
+
+function syncLibraryUrl() {
+  history.replaceState({nasreader:true, series:state.series || ''}, '', libraryUrlForCurrentState());
+}
+
+function saveReaderContext(id) {
+  const b = state.books.find(x => x.id === +id);
+  const fromSeries = !!state.series;
+  const seriesCategory = fromSeries ? (state.seriesCategory || b?.category || state.category || '') : '';
+  const returnParams = new URLSearchParams();
+  if (fromSeries) { returnParams.set('series', state.series); if (seriesCategory) returnParams.set('category', seriesCategory); returnParams.set('view','books'); }
+  const ctx = {
+    from: fromSeries ? 'series' : 'library',
+    series: fromSeries ? state.series : (b?.series || ''),
+    category: fromSeries ? seriesCategory : (b?.category || ''),
+    orderedIds: fromSeries ? state.books.map(x => x.id) : [],
+    returnUrl: fromSeries ? `/?${returnParams.toString()}` : (location.pathname + location.search),
+    scrollY: window.scrollY || 0,
+    openedAt: Date.now()
+  };
+  try { sessionStorage.setItem('nasreader.readerContext', JSON.stringify(ctx)); } catch {}
+}
+
+function openReader(id) {
+  saveReaderContext(id);
+  location.href = `/reader/${id}`;
+}
+
+function restoreSeriesScrollOnce() {
+  if (state.__scrollRestored || !state.series) return;
+  let ctx = null;
+  try { ctx = JSON.parse(sessionStorage.getItem('nasreader.readerContext') || 'null'); } catch {}
+  if (!ctx || ctx.from !== 'series' || ctx.series !== state.series || (ctx.category || '') !== (state.seriesCategory || state.category || '')) return;
+  state.__scrollRestored = true;
+  const y = Math.max(0, Number(ctx.scrollY) || 0);
+  requestAnimationFrame(() => window.scrollTo(0, y));
+  setTimeout(() => window.scrollTo(0, y), 180);
+}
 
 async function authInit() {
   const s = await fetch('/api/auth/status').then(r => r.json());
@@ -76,7 +150,8 @@ function restoreControls() {
 function query() {
   const p = new URLSearchParams();
   if (state.q) p.set('q', state.q);
-  if (state.category) p.set('category', state.category);
+  const effectiveCategory = state.series ? (state.seriesCategory || state.category) : state.category;
+  if (effectiveCategory) p.set('category', effectiveCategory);
   if (state.series) p.set('series', state.series);
   p.set('sort', state.sort);
   if ($('#showArchived').checked) p.set('show_archived','true');
@@ -85,8 +160,19 @@ function query() {
 }
 
 async function load() {
-  const d = await api('/api/library?' + query());
-  state.books = d.books;
+  const seq = ++loadSeq;
+  if (loadController) loadController.abort();
+  const controller = new AbortController();
+  loadController = controller;
+  let d;
+  try {
+    d = await api('/api/library?' + query(), {signal: controller.signal});
+  } catch (e) {
+    if (e?.name === 'AbortError') return;
+    throw e;
+  }
+  if (seq !== loadSeq) return;
+  state.books = sortBooksForUi(d.books || [], state.sort);
   state.allSeries = d.series;
   state.categories = d.categories || [];
   state.allowDelete = d.allow_delete_files;
@@ -103,6 +189,7 @@ async function load() {
   renderContinue();
   render();
   renderScan(d.scan);
+  restoreSeriesScrollOnce();
 }
 
 function renderCategoryTabs() {
@@ -112,17 +199,25 @@ function renderCategoryTabs() {
   $$('#categoryTabs button').forEach(b => b.onclick = () => {
     state.category = b.dataset.category;
     localStorage.setItem('nasreader.category', state.category);
-    state.series = '';
+    state.series = ''; state.seriesCategory = '';
+    syncLibraryUrl();
     load();
   });
 }
 
+function seriesOptionValue(x) { return `${encodeURIComponent(x.category)}|${encodeURIComponent(x.series)}`; }
 function renderSeriesFilter(list) {
-  const s = $('#seriesFilter'), old = state.series;
-  const filtered = list.filter(x => !state.category || x.category === state.category);
-  s.innerHTML = '<option value="">All series</option>' + filtered.map(x => `<option value="${esc(x.series)}">${esc(x.series)} (${x.count})</option>`).join('');
-  if ([...s.options].some(o => o.value === old)) s.value = old;
-  else { state.series = ''; s.value = ''; }
+  const s = $('#seriesFilter');
+  const filtered = list.filter(x => !state.category || x.category === state.category).sort((a,b)=>compareText(a.series,b.series)||compareText(a.category,b.category));
+  s.innerHTML = '<option value="">All series</option>' + filtered.map(x => {
+    const label = state.category ? `${x.series} (${x.count})` : `${x.series} · ${x.category} (${x.count})`;
+    return `<option value="${esc(seriesOptionValue(x))}">${esc(label)}</option>`;
+  }).join('');
+  if (state.series) {
+    const wanted = seriesOptionValue({category:state.seriesCategory || state.category,series:state.series});
+    if ([...s.options].some(o => o.value === wanted)) s.value = wanted;
+    else { state.series = ''; state.seriesCategory=''; s.value = ''; }
+  } else s.value = '';
 }
 
 function renderContinue() {
@@ -133,8 +228,8 @@ function renderContinue() {
   const sec = $('#continueSection');
   if (!books.length || state.selection) { sec.classList.add('hidden'); return; }
   sec.classList.remove('hidden');
-  $('#continueRow').innerHTML = books.map(b => `<button class="continue-card" data-open-reader="${b.id}"><img src="/api/books/${b.id}/thumb" loading="lazy"><span><strong>${esc(b.title)}</strong><small>${b.last_page}/${b.page_count} · ${b.progress}%</small></span></button>`).join('');
-  $$('[data-open-reader]').forEach(x => x.onclick = () => location.href = `/reader/${x.dataset.openReader}`);
+  $('#continueRow').innerHTML = books.map(b => `<button class="continue-card" data-open-reader="${b.id}"><img src="/api/books/${b.id}/thumb" loading="lazy"><span><strong>${esc(b.title)}</strong><small>${b.file_type==='epub'?`EPUB · ${b.progress}%`:`${b.last_page}/${b.page_count} · ${b.progress}%`}</small></span></button>`).join('');
+  $$('[data-open-reader]').forEach(x => x.onclick = () => openReader(+x.dataset.openReader));
 }
 
 function syncViewButtons() {
@@ -169,7 +264,7 @@ function bookCard(b) {
     </div>
     <div class="book-info">
       <div class="book-title">${esc(b.title)}</div>
-      <div class="meta"><span>${esc(b.series || b.category)}</span><span>${b.page_count}p</span></div>
+      <div class="meta"><span>${esc(b.series || b.category)}</span><span>${b.file_type==='epub'?'EPUB':`${b.page_count}p`}</span></div>
       <div class="chips">${b.volume?`<span class="chip">#${esc(b.volume)}</span>`:''}${b.tags.slice(0,2).map(t=>`<span class="chip">${esc(t)}</span>`).join('')}</div>
     </div>
   </article>`;
@@ -189,8 +284,8 @@ function renderSeriesCards(g) {
     if (!grouped.has(key)) grouped.set(key, []);
     grouped.get(key).push(b);
   }
-  const cards = [...grouped.values()].sort((a,b)=>natural(a[0].series).localeCompare(natural(b[0].series),undefined,{numeric:true,sensitivity:'base'})).map(items => {
-    items.sort((a,b)=>natural(a.volume||a.title).localeCompare(natural(b.volume||b.title),undefined,{numeric:true,sensitivity:'base'}));
+  const cards = [...grouped.values()].sort((a,b)=>compareText(a[0].series,b[0].series)||compareText(a[0].category,b[0].category)).map(items => {
+    items.sort((a,b)=>compareText(a.volume||a.title,b.volume||b.title)||compareText(a.title,b.title));
     const first = items[0], read = items.filter(x=>x.read_state==='read').length;
     const avg = Math.round(items.reduce((s,x)=>s+x.progress,0)/items.length);
     return `<article class="series-card" data-series="${esc(first.series)}" data-category="${esc(first.category)}">
@@ -203,23 +298,22 @@ function renderSeriesCards(g) {
   bindSeriesCards();
   bindCards();
 }
-function natural(x='') { return String(x).toLowerCase(); }
-
 function bindSeriesCards() {
   $$('.series-card').forEach(card => {
     let lp = null, suppress = false;
-    const name = card.dataset.series;
+    const name = card.dataset.series, category = card.dataset.category;
     card.addEventListener('pointerdown', e => {
       if (e.pointerType === 'touch') lp = setTimeout(() => {
         suppress = true; state.view='books'; setSelection(true);
-        state.books.filter(b=>b.series===name).forEach(b=>state.selected.add(b.id));
+        state.books.filter(b=>b.series===name && b.category===category).forEach(b=>state.selected.add(b.id));
         navigator.vibrate?.(20); render();
       }, 450);
     });
     ['pointerup','pointercancel','pointermove'].forEach(ev=>card.addEventListener(ev,()=>clearTimeout(lp)));
     card.onclick = () => {
       if (suppress) { suppress=false; return; }
-      state.series = name; $('#seriesFilter').value = name; state.view='books'; syncViewButtons(); load();
+      state.series = name; state.seriesCategory = category; $('#seriesFilter').value = seriesOptionValue({category,series:name});
+      state.view='books'; syncViewButtons(); state.__scrollRestored=false; syncLibraryUrl(); load();
     };
   });
 }
@@ -244,13 +338,14 @@ function bindCards() {
           ids.slice(Math.min(a,b),Math.max(a,b)+1).forEach(x=>state.selected.add(x)); render();
         } else toggle(id);
         state.lastSelected = id;
-      } else location.href = `/reader/${id}`;
+      } else openReader(id);
     });
   });
   $$('[data-star]').forEach(x => x.onclick = async e => {
     e.stopPropagation();
-    const id=+x.dataset.star, b=state.books.find(z=>z.id===id);
-    await api(`/api/books/${id}`, {method:'PATCH', body:{favorite:!b.favorite}}); load();
+    const id=+x.dataset.star, b=state.books.find(z=>z.id===id); if(!b)return;
+    const updated=await api(`/api/books/${id}`, {method:'PATCH', body:{favorite:!b.favorite}});
+    b.favorite=!!updated.favorite; x.textContent=b.favorite?'★':'☆';
   });
   $$('[data-more]').forEach(x => x.onclick = e => { e.stopPropagation(); openDetails(+x.dataset.more); });
 }
@@ -274,46 +369,51 @@ function categoryOptions(selected='') {
 
 async function openDetails(id) {
   const b = await api(`/api/books/${id}`);
-  const pages=[1,Math.min(2,b.page_count),Math.min(3,b.page_count)].filter((x,i,a)=>x&&a.indexOf(x)===i);
+  const isEpub=b.file_type==='epub';
+  const pages=isEpub?[]:[1,Math.min(2,b.page_count),Math.min(3,b.page_count)].filter((x,i,a)=>x&&a.indexOf(x)===i);
+  const preview=isEpub?`<div class="detail-preview"><img loading="lazy" src="/api/books/${id}/thumb"></div>`:`<div class="detail-preview">${pages.map(p=>`<img loading="lazy" src="/api/books/${id}/preview/${p}">`).join('')}</div>`;
+  const stats=isEpub?`<div class="detail-stats"><span>EPUB</span><span>${b.page_count||0} chapters</span><span>${b.progress}% read</span></div>`:`<div class="detail-stats"><span>${b.page_count} pages</span><span>${b.progress}% read</span><span>Page ${b.last_page}</span></div>`;
   $('#modalBody').innerHTML = `
     <div class="detail-head"><div><h2>${esc(b.title)}</h2><div class="detail-sub">${esc(b.series||'Standalone')}${b.volume?` · #${esc(b.volume)}`:''} · ${esc(b.category)}</div></div></div>
-    <div class="detail-preview">${pages.map(p=>`<img loading="lazy" src="/api/books/${id}/preview/${p}">`).join('')}</div>
-    <div class="detail-stats"><span>${b.page_count} pages</span><span>${b.progress}% read</span><span>Page ${b.last_page}</span></div>
+    ${preview}
+    ${stats}
     <div class="detail-actions">
-      <a class="button-link primary" href="/reader/${id}">Read / Resume</a>
-      <a class="button-link" href="/api/books/${id}/file?download=true">Download</a>
+      <button id="detailRead" class="button-link primary">Read / Resume</button>
+      <a class="button-link" href="/api/books/${id}/file?download=true">Download ${isEpub?'EPUB':'PDF'}</a>
       <button id="detailFav">${b.favorite?'★ Unfavorite':'☆ Favorite'}</button>
       <button id="detailEdit">Edit</button>
     </div>
     <div class="path-meta">${esc(b.rel_path)}</div>
     <div id="detailEditPane" class="hidden"></div>`;
   showModal();
-  $('#detailFav').onclick = async () => { await api(`/api/books/${id}`,{method:'PATCH',body:{favorite:!b.favorite}}); hideModal(); load(); };
+  $('#detailRead').onclick = () => openReader(id);
+  $('#detailFav').onclick = async () => { const updated=await api(`/api/books/${id}`,{method:'PATCH',body:{favorite:!b.favorite}}); const local=state.books.find(x=>x.id===id); if(local)local.favorite=!!updated.favorite; hideModal(); render(); };
   $('#detailEdit').onclick = () => showEditPane(id,b);
 }
 
+
 function showEditPane(id,b) {
   const pane = $('#detailEditPane');
+  const isEpub=b.file_type==='epub';
   pane.classList.remove('hidden');
   pane.innerHTML = `<div class="form-grid detail-edit">
     <label>Title<input id="eTitle" value="${esc(b.title)}"></label>
     <label>Category<select id="eCategory">${categoryOptions(b.category)}</select></label>
     <label>Series<input id="eSeries" value="${esc(b.series||'')}"></label>
     <label>Volume / Part<input id="eVolume" value="${esc(b.volume||'')}"></label>
-    <label>Cover page<input id="eCover" type="number" min="1" max="${b.page_count}" value="${b.cover_page}"></label>
+    ${isEpub?'':`<label>Cover page<input id="eCover" type="number" min="1" max="${b.page_count}" value="${b.cover_page}"></label>`}
     <label>Tags<input id="eTags" value="${esc(b.tags.join(', '))}"></label>
     <div class="row"><button id="saveEdit" class="primary">Save</button><button id="resetTitle">Reset title to filename</button></div>
   </div>`;
   $('#saveEdit').onclick = async () => {
-    await api(`/api/books/${id}`, {method:'PATCH', body:{
-      title:$('#eTitle').value, category:$('#eCategory').value, series:$('#eSeries').value||null,
-      volume:$('#eVolume').value||null, cover_page:+$('#eCover').value,
-      tags:$('#eTags').value.split(',').map(x=>x.trim()).filter(Boolean)
-    }});
+    const body={title:$('#eTitle').value,category:$('#eCategory').value,series:$('#eSeries').value||null,volume:$('#eVolume').value||null,tags:$('#eTags').value.split(',').map(x=>x.trim()).filter(Boolean)};
+    if(!isEpub)body.cover_page=+$('#eCover').value;
+    await api(`/api/books/${id}`, {method:'PATCH', body});
     hideModal(); toast('Saved'); load();
   };
   $('#resetTitle').onclick = async () => { await api(`/api/books/${id}/reset-title`,{method:'POST'}); hideModal(); toast('Title reset'); load(); };
 }
+
 
 function showModal() { $('#modal').classList.remove('hidden'); }
 function hideModal() { $('#modal').classList.add('hidden'); }
@@ -336,7 +436,7 @@ function bulkPrompt(kind) {
     }); bindChoiceSoon(); return;
   }
   if(kind==='series') {
-    const opts=[...new Set(state.allSeries.filter(x=>!state.category||x.category===state.category).map(x=>x.series))].sort();
+    const opts=[...new Set(state.allSeries.filter(x=>!state.category||x.category===state.category).map(x=>x.series))].sort(compareText);
     actionSheet(`Move ${n} books to series`,`<label>Series<input id="bulkSeries" list="seriesNames" placeholder="Blank = Standalone"></label><datalist id="seriesNames">${opts.map(x=>`<option value="${esc(x)}">`).join('')}</datalist>`,()=>runBulk('series',$('#bulkSeries').value)); return;
   }
   if(kind==='tag') {
@@ -348,8 +448,8 @@ function bulkPrompt(kind) {
   if(kind==='favorite') { actionSheet(`Favorite ${n} books`,`<div class="choice-grid"><button class="choice selected" data-value="1">Favorite</button><button class="choice" data-value="0">Unfavorite</button></div>`,()=>runBulk('favorite',$('.choice.selected')?.dataset.value==='1'));bindChoiceSoon();return; }
   if(kind==='archive') { actionSheet(`Archive ${n} books`,`<div class="choice-grid"><button class="choice selected" data-value="1">Archive</button><button class="choice" data-value="0">Unarchive</button></div>`,()=>runBulk('archive',$('.choice.selected')?.dataset.value==='1'));bindChoiceSoon();return; }
   if(kind==='preview') return actionSheet('Regenerate previews',`<p>Clear cached covers/previews for ${n} selected books and regenerate covers in the background.</p>`,()=>runBulk('regen_preview',true));
-  if(kind==='remove') return actionSheet('Remove from library',`<div class="warning-box">Remove ${n} books from the index? <strong>PDF files stay on the NAS.</strong> The paths will be ignored until you explicitly import them again.</div>`,()=>runBulk('remove_library',true));
-  if(kind==='delete') return actionSheet('Delete PDF files',`<div class="danger-box"><strong>Permanent deletion.</strong><br>Delete ${n} selected PDF files from the NAS? This cannot be undone.</div><label class="confirm-line"><input id="deleteConfirm" type="checkbox"> I understand these files will be deleted from the NAS.</label>`,()=>{if(!$('#deleteConfirm').checked)return toast('Confirm permanent deletion first');runBulk('delete_files',true)});
+  if(kind==='remove') return actionSheet('Remove from library',`<div class="warning-box">Remove ${n} books from the index? <strong>Book files stay on the NAS.</strong> The paths will be ignored until you explicitly import them again.</div>`,()=>runBulk('remove_library',true));
+  if(kind==='delete') return actionSheet('Delete book files',`<div class="danger-box"><strong>Permanent deletion.</strong><br>Delete ${n} selected book files from the NAS? This cannot be undone.</div><label class="confirm-line"><input id="deleteConfirm" type="checkbox"> I understand these files will be deleted from the NAS.</label>`,()=>{if(!$('#deleteConfirm').checked)return toast('Confirm permanent deletion first');runBulk('delete_files',true)});
 }
 function bindChoiceSoon(){setTimeout(()=>$$('.choice').forEach(b=>b.onclick=()=>{b.parentElement.querySelectorAll('.choice').forEach(x=>x.classList.remove('selected'));b.classList.add('selected')}),0)}
 
@@ -362,6 +462,10 @@ async function renderScan(s) {
     setTimeout(async()=>renderScan(await api('/api/scan/status')),1000);
   } else if(s.error) {
     el.classList.remove('hidden'); el.textContent='Rescan error: '+s.error;
+  } else if((s.suspicious_sources||[]).length) {
+    el.classList.remove('hidden'); el.textContent=`Rescan safety stop: ${(s.suspicious_sources||[]).map(x=>`${x.source} looked empty (${x.previous} indexed before)`).join(', ')}. Existing books were kept.`;
+  } else if((s.unreadable||[]).length) {
+    el.classList.remove('hidden'); el.textContent=`Rescan finished with ${(s.unreadable||[]).length} unreadable file(s). First: ${s.unreadable[0].path}`;
   } else if((s.sources_skipped||[]).length) {
     el.classList.remove('hidden'); el.textContent=`Rescan finished. Skipped source: ${(s.sources_skipped||[]).join(', ')}. Nothing from skipped sources was marked missing.`;
   } else el.classList.add('hidden');
@@ -370,34 +474,40 @@ async function renderScan(s) {
 async function openImport(path='') {
   const d = await api('/api/import/browse?path='+encodeURIComponent(path));
   const current = d.path || '/';
+  const files=d.files||[];
   $('#modalBody').innerHTML = `<h2>Import from NAS</h2>
-    <p class="muted">Register existing PDFs only. No PDF is copied or duplicated.</p>
+    <p class="muted">Register existing PDF / EPUB files only. Nothing is copied or duplicated.</p>
     <div class="import-path">📁 ${esc(current)}</div>
     <div class="import-browser">
       ${d.path ? `<button class="import-entry folder" data-import-dir="${esc(d.parent)}">↰ ..</button>` : ''}
       ${d.dirs.map(x=>`<button class="import-entry folder" data-import-dir="${esc(x.path)}">📁 <span>${esc(x.name)}</span></button>`).join('')}
-      ${d.pdfs.map(x=>`<label class="import-entry pdf ${x.indexed?'indexed':''}"><input type="checkbox" data-import-pdf="${esc(x.path)}" ${x.indexed?'disabled':''}><span>📄 ${esc(x.name)}</span><small>${x.indexed?'Already in library':''}</small></label>`).join('')}
-      ${!d.dirs.length&&!d.pdfs.length?'<div class="empty-mini">No folders or PDFs here.</div>':''}
+      ${files.map(x=>`<label class="import-entry pdf ${x.indexed?'indexed':''}"><input type="checkbox" data-import-file="${esc(x.path)}" ${x.indexed?'disabled':''}><span>${x.file_type==='epub'?'📘':'📄'} ${esc(x.name)}</span><small>${x.indexed?'Already in library':(x.file_type||'PDF').toUpperCase()}</small></label>`).join('')}
+      ${!d.dirs.length&&!files.length?'<div class="empty-mini">No PDF or EPUB files here.</div>':''}
     </div>
-    <div class="row import-actions"><button id="importSelectAll">Select all PDFs</button><button id="doImport" class="primary">Import selected</button></div>`;
+    <div class="row import-actions"><button id="importSelectAll">Select all books</button><button id="doImport" class="primary">Import selected</button></div>`;
   showModal();
   $$('[data-import-dir]').forEach(b=>b.onclick=()=>openImport(b.dataset.importDir));
-  $('#importSelectAll').onclick=()=>$$('[data-import-pdf]:not(:disabled)').forEach(x=>x.checked=true);
+  $('#importSelectAll').onclick=()=>$$('[data-import-file]:not(:disabled)').forEach(x=>x.checked=true);
   $('#doImport').onclick=async()=>{
-    const paths=$$('[data-import-pdf]:checked').map(x=>x.dataset.importPdf);
-    if(!paths.length)return toast('Select PDFs first');
+    const paths=$$('[data-import-file]:checked').map(x=>x.dataset.importFile);
+    if(!paths.length)return toast('Select book files first');
     const r=await api('/api/import',{method:'POST',body:{paths}});
     toast(`Imported ${r.added}, restored ${r.restored}, existing ${r.kept}`);
     hideModal(); load();
   };
 }
 
+
 async function showSettings() {
   const cats = await api('/api/categories');
   state.categories = cats;
+  let cacheStats={books:0,bytes:0};try{cacheStats=await window.ReaderCache?.stats?.()||cacheStats}catch{}
+  const cacheMb=(cacheStats.bytes/1024/1024).toFixed(cacheStats.bytes>100*1024*1024?0:1);
   $('#modalBody').innerHTML = `<h2>Settings</h2>
     <section class="settings-section"><h3>Categories</h3><div id="categoryManager"></div><div class="row"><input id="newCategory" placeholder="New category"><button id="addCategory" class="primary">Add</button></div></section>
     <section class="settings-section"><h3>Missing files</h3><p>${state.missingCount} hidden record(s). Missing paths are kept for ${state.missingRetention} days, then purged automatically.</p><button id="cleanMissing" ${state.missingCount?'':'disabled'}>Clean missing paths now</button></section>
+    <section class="settings-section"><h3>Recent reading cache</h3><p>${cacheStats.books} cached book(s) · about ${cacheMb} MB. Short visits expire after 3 hours. Books read for 3+ minutes stay for 24 hours from the latest reading session and are cleaned automatically.</p><button id="clearReadingCache" ${cacheStats.books?'':'disabled'}>Clear Recent Reading Cache</button></section>
+    <section class="settings-section"><h3>App cache</h3><p>Reload the current app shell and static assets without touching your library, reading progress, categories, account, or recent reading cache.</p><button id="refreshAppCache">Refresh App Cache</button></section>
     <section class="settings-section"><h3>Account · ${esc(state.username)}</h3><div class="form-grid"><label>Current password<input id="currentPw" type="password" autocomplete="current-password"></label><label>New password<input id="newPw" type="password" autocomplete="new-password" placeholder="10+ characters"></label><label>Confirm new password<input id="confirmPw" type="password" autocomplete="new-password"></label></div><div class="row"><button id="changePw" class="primary">Change password</button><button id="logoutBtn2">Logout</button></div></section>`;
   showModal();
   renderCategoryManager();
@@ -406,6 +516,8 @@ async function showSettings() {
     state.categories=await api('/api/categories',{method:'POST',body:{name}}); $('#newCategory').value=''; renderCategoryManager(); load();
   };
   $('#cleanMissing').onclick=async()=>{const r=await api('/api/missing/clean',{method:'POST'});toast(`Cleaned ${r.purged} missing record(s)`);hideModal();load();};
+  $('#clearReadingCache').onclick=async()=>{await window.ReaderCache?.clearAll?.();toast('Recent reading cache cleared');hideModal();};
+  $('#refreshAppCache').onclick=async()=>{try{if('serviceWorker' in navigator){const regs=await navigator.serviceWorker.getRegistrations();await Promise.all(regs.map(r=>r.unregister()));}if('caches' in window){const keys=await caches.keys();await Promise.all(keys.filter(k=>k.startsWith('nas-pdf-reader')||k.startsWith('nasreader')).map(k=>caches.delete(k)));}}catch{}location.replace('/?refresh='+Date.now());};
   $('#changePw').onclick=async()=>{
     const current=$('#currentPw').value, next=$('#newPw').value, confirm=$('#confirmPw').value;
     if(next!==confirm)return toast('New passwords do not match');
@@ -414,6 +526,7 @@ async function showSettings() {
   };
   $('#logoutBtn2').onclick=async()=>{await api('/api/auth/logout',{method:'POST'});location.reload();};
 }
+
 
 function renderCategoryManager() {
   const wrap=$('#categoryManager'); if(!wrap)return;
@@ -447,11 +560,11 @@ $$('[data-bulk]').forEach(b=>b.onclick=()=>bulkPrompt(b.dataset.bulk));
 $('#modalX').onclick=hideModal;
 $('#modal').onclick=e=>{if(e.target===$('#modal'))hideModal()};
 $('#search').oninput=debounce(()=>{state.q=$('#search').value;load()},250);
-$('#seriesFilter').onchange=()=>{state.series=$('#seriesFilter').value;if(state.series)state.view='books';load()};
+$('#seriesFilter').onchange=()=>{const raw=$('#seriesFilter').value;if(raw){const cut=raw.indexOf('|');state.seriesCategory=decodeURIComponent(cut>=0?raw.slice(0,cut):'');state.series=decodeURIComponent(cut>=0?raw.slice(cut+1):raw);state.view='books';}else{state.series='';state.seriesCategory='';}state.__scrollRestored=false;syncLibraryUrl();load()};
 $('#sort').onchange=()=>{state.sort=$('#sort').value;localStorage.setItem('nasreader.sort',state.sort);load()};
 $('#favorites').onchange=load;
 $('#showArchived').onchange=load;
-$('#seriesBackBtn').onclick=()=>{state.series='';$('#seriesFilter').value='';state.view='series';syncViewButtons();load()};
+$('#seriesBackBtn').onclick=()=>{state.series='';state.seriesCategory='';$('#seriesFilter').value='';state.view='series';state.__scrollRestored=false;syncViewButtons();syncLibraryUrl();load()};
 $$('#viewToggle button').forEach(b=>b.onclick=()=>setView(b.dataset.view));
 function debounce(fn,ms){let t;return()=>{clearTimeout(t);t=setTimeout(fn,ms)}}
 if('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').catch(()=>{});

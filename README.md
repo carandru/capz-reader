@@ -1,64 +1,64 @@
 # NAS PDF Reader
 
-A lightweight, NAS-first PDF library and reader designed for large personal collections and touch-first use on iPad.
+A lightweight, self-hosted PDF and EPUB library designed for NAS deployment and touch-first reading on tablets.
 
-Version: **0.2.0**
+Version: **0.3.4**
 
-## Why this exists
+## What it does
 
-The app keeps original PDFs in their existing NAS folders. It indexes the existing paths, stores library metadata and reading state in SQLite, and keeps generated thumbnails/previews in a separate cache. Importing a PDF never copies the source file.
+- Indexes existing PDF and EPUB files without copying the source books.
+- Stores library metadata, categories, series, tags, favorites, and reading progress in SQLite.
+- Uses generated thumbnails/page renders in a separate cache.
+- Keeps source-library mounts read-only by default.
+- Supports touch-first PDF reading, EPUB reading, series navigation, bulk actions, and private single-user authentication.
 
-## Highlights in v0.2.0
+## Reader highlights
 
-- Tap a book card to resume reading immediately; use the three-dot button for details/editing.
-- iPad-first full-screen reader with `Fit page` and `Fit width`.
-- Single page, real double-page spread, vertical, LTR and RTL modes.
-- Auto-hiding reader controls, loading state, neighboring-page preload and swipe navigation.
-- Dynamic categories: create, rename, hide and remove them from Settings.
-- NAS Import browser: register selected existing PDFs without duplicating them.
-- Rescan uses the PDF path as identity. Existing paths keep user-edited metadata and progress.
-- If a file disappears, its record is hidden immediately and kept for 14 days by default before cleanup.
-- If the same path returns during the grace period, its metadata/progress is restored.
-- If a PDF is renamed, the old path becomes missing and the new path is indexed as a new book.
-- A mounted source that cannot be read is never treated as an empty folder, preventing accidental mass-missing state.
-- Password can be changed from Settings.
-- v0.1 databases migrate in place.
+- PDF: Single, Double, Vertical, Fit Page / Fit Width, LTR / RTL, swipe navigation, page filmstrip, and progress resume.
+- EPUB: chapter navigation, table of contents, font size, line spacing, themes, and reading-position resume.
+- Persistent low-opacity Show/Hide UI control for distraction-free reading.
+- Recent-reading device cache: short visits expire after 3 hours; actively read books use a 24-hour sliding cache window.
+- PDF whole-book caching is progressive and yields to interactive reading.
+- Generated NAS page/preview cache is cleaned by age and soft size limits.
+- Series-aware Back and next-volume flow.
+- Thai-aware natural sorting with numeric volume ordering.
 
-## Library model
+## Library behavior
 
-Docker mounts source folders below `/library`. The first folder name is used only as the **initial category** for newly discovered PDFs. Afterwards, the logical category can be changed freely in the app without moving the PDF.
+Docker mounts one library root at `/library`. The first folder below that root is used only as the **initial logical category** for newly discovered books. Categories can later be changed in the app without moving source files.
 
-Example:
+Generic example:
 
 ```text
-/library/Novel/Example Series/Example Series 01.pdf
-/library/Manga/Another Series/Another Series 01.pdf
+/library/Books/Example Series/Example Series 01.pdf
+/library/Comics/Another Series/Another Series 02.epub
 ```
 
-For a new PDF, the scanner initially infers:
+A newly discovered file can initially infer:
 
 ```text
-source folder: Novel
-category: Novel
+source folder: Books
+category: Books
 series: Example Series
 ```
 
-Changing the category in the app does not rename or move the source file.
+Changing the category or series in the app does not rename or move the source file.
 
-## Import vs Rescan
+## Import and Rescan
 
-**Import** lets you browse mounted NAS folders and register selected PDFs immediately. It stores only the existing relative path; no PDF is uploaded or copied.
+**Import** registers selected existing PDF/EPUB paths from the mounted library. It does not upload or duplicate the file.
 
-**Rescan** synchronizes the index with all readable mounted source folders:
+**Rescan** synchronizes the index:
 
 ```text
-existing path -> keep metadata/progress, refresh technical file info if needed
-new path      -> add
-missing path  -> hide and start the grace period
-unreadable source -> skip missing detection for that source
+unchanged path -> no database write and no unnecessary media work
+changed path   -> refresh technical metadata while preserving user metadata
+new path       -> add
+missing path   -> hide and start the grace period
+unreadable source -> skip destructive missing detection for that source
 ```
 
-Missing records are retained for `MISSING_RETENTION_DAYS` (default `14`) and then purged together with their generated cache. Settings also provides a manual `Clean missing paths now` action.
+Missing records are retained for `MISSING_RETENTION_DAYS` (default `14`) and then purged with generated cache. A suspicious large source drop is protected from automatic mass-missing changes until explicitly confirmed.
 
 ## Docker setup
 
@@ -68,34 +68,18 @@ Copy the example configuration:
 cp .env.example .env
 ```
 
-Edit `.env` for your machine:
+Edit `.env` for your host:
 
 ```env
 PUID=1000
 PGID=1000
 PORT=8020
-
-NOVEL_PATH=/path/to/novels
-MANGA_PATH=/path/to/manga
-
+LIBRARY_PATH=/path/to/library
 LIBRARY_ACCESS=ro
 ALLOW_DELETE_FILES=false
-MISSING_RETENTION_DAYS=14
 ```
 
-Add additional source mounts in `docker-compose.yml` when needed, for example:
-
-```yaml
-- "/path/to/artbooks:/library/Artbook:ro"
-```
-
-The next Rescan will discover the PDFs and create `Artbook` as an initial logical category if it does not exist yet.
-
-On Linux/NAS systems, find the UID/GID of the account that can read the library folders with:
-
-```bash
-id your-user
-```
+On Linux/NAS systems, use the UID/GID of an account that can read the library directory.
 
 Build and start:
 
@@ -103,10 +87,10 @@ Build and start:
 docker compose up -d --build
 ```
 
-Open:
+Open the app at:
 
 ```text
-http://<server-ip>:8020
+http://<server-address>:8020
 ```
 
 On first run, create the single administrator account.
@@ -120,26 +104,26 @@ LIBRARY_ACCESS=ro
 ALLOW_DELETE_FILES=false
 ```
 
-`Remove from library` removes only the index record and ignores that exact path on future rescans until you explicitly Import it again.
+`Remove from library` removes only the index record and ignores that exact path on future rescans until it is explicitly imported again.
 
 Permanent source-file deletion requires both a read-write mount and `ALLOW_DELETE_FILES=true`.
 
-## Data locations
+## Runtime data
 
-The app writes only to:
+The app writes runtime state only to the configured data/cache mounts:
 
 ```text
-./data   -> SQLite database, library metadata and reading state
-./cache  -> generated thumbnails, previews and rendered pages
+/data   -> SQLite database, metadata, sessions, reading state
+/cache  -> generated thumbnails, previews, rendered pages, EPUB cover cache
 ```
 
-Original PDFs stay in the mounted source folders.
+Original PDF/EPUB files remain in `/library` and are not copied by Import.
 
-## Private remote access
+## Remote access
 
-The intended deployment is private LAN or private VPN/Tailscale access rather than direct public exposure.
+The recommended deployment is a private LAN or private VPN/mesh network. Do not expose the application directly to the public internet unless you place it behind an appropriately configured HTTPS reverse proxy and apply normal host/network hardening.
 
-For plain HTTP on a private network:
+For private HTTP:
 
 ```env
 COOKIE_SECURE=false
@@ -151,6 +135,17 @@ Behind HTTPS:
 COOKIE_SECURE=true
 ```
 
-## Git safety
+## Security model
 
-Do not commit `.env`, SQLite databases, source PDFs, cache contents, keys, certificates, credentials, tokens, or machine-specific private paths.
+- Single-user authentication with Argon2 password hashing.
+- Protected API routers fail closed by default.
+- Detailed diagnostics require authentication.
+- Media cache responses are private.
+- Source paths are validated to stay within the configured library root.
+- Library mounts are read-only by default.
+
+## Repository hygiene
+
+Do not commit `.env`, runtime databases, cache contents, source books, credentials, keys/certificates, tokens, or host-specific private paths.
+
+The repository intentionally contains only application source, dependency/configuration templates, empty runtime-directory placeholders, and third-party license notices.
